@@ -472,36 +472,78 @@ function Invoke-ObfuscationScan {
 }
 
 function Invoke-JvmScan {
-    $results = [System.Collections.Generic.List[string]]::new()
-    $javaProc = Get-Process javaw -ErrorAction SilentlyContinue
-    if (-not $javaProc) { $javaProc = Get-Process java -ErrorAction SilentlyContinue }
-    if (-not $javaProc) { return $results }
-    $javaPid = ($javaProc | Select-Object -First 1).Id
-    try {
-        $wmi = Get-WmiObject Win32_Process -Filter "ProcessId = $javaPid" -ErrorAction Stop
-        $cmdLine = $wmi.CommandLine
-        if ($cmdLine) {
-            $agentMatches = [regex]::Matches($cmdLine, '-javaagent:([^\s"]+)')
-            foreach ($m in $agentMatches) {
-                $agentPath = $m.Groups[1].Value.Trim('"').Trim("'")
-                $agentName = [System.IO.Path]::GetFileName($agentPath)
-                $legitAgents = @("jmxremote","yjp","jrebel","newrelic","jacoco","theseus")
-                $isLegit = $false
-                foreach ($la in $legitAgents) { if ($agentName -match $la) { $isLegit=$true; break } }
-                if (-not $isLegit) { $results.Add("JVM Agent — -javaagent:$agentName (path: $agentPath)") }
-            }
-            $suspiciousFlags = @(
-                @{ Flag="-Xbootclasspath/p:"; Desc="prepends to bootstrap classpath, overrides core Java classes" },
-                @{ Flag="-Xbootclasspath/a:"; Desc="appends to bootstrap classpath, injects below classloader" },
-                @{ Flag="-agentlib:jdwp";     Desc="JDWP debug agent, remote debugging enabled" },
-                @{ Flag="-agentpath:";         Desc="native agent loaded, bypasses Java sandbox" }
-            )
-            foreach ($sf in $suspiciousFlags) {
-                if ($cmdLine -match [regex]::Escape($sf.Flag)) { $results.Add("Suspicious JVM flag — $($sf.Flag) ($($sf.Desc))") }
+    # Integrated JVM Argument Scanner Logic
+    $sep = "━" * 76
+    Write-Host $sep -ForegroundColor Yellow
+    Write-Host "JVM ARGUMENTS INJECTION SCANNER" -ForegroundColor Yellow
+    Write-Host $sep -ForegroundColor Yellow
+    Write-Host ""
+
+    $javaProcesses = Get-Process -Name javaw -ErrorAction SilentlyContinue
+    if ($javaProcesses.Count -eq 0) {
+        Write-Host "  [!] No javaw.exe processes found" -ForegroundColor Yellow
+        Write-Host "  [i] Make sure Minecraft is running`n" -ForegroundColor Yellow
+    } else {
+        Write-Host "  [i] Scanning $($javaProcesses.Count) Java process(es)...`n" -ForegroundColor White
+        $foundInjection = $false
+
+        $fabricPatterns = @{
+            "fabric.addMods"='-Dfabric\.addMods='; "fabric.loadMods"='-Dfabric\.loadMods='; "fabric.classPathGroups"='-Dfabric\.classPathGroups='; "fabric.gameJarPath"='-Dfabric\.gameJarPath='; "fabric.skipMcProvider"='-Dfabric\.skipMcProvider='; "fabric.development"='-Dfabric\.development='; "fabric.allowUnsupportedVersion"='-Dfabric\.allowUnsupportedVersion='; "fabric.remapClasspathFile"='-Dfabric\.remapClasspathFile='; "fabric.skipIntermediary"='-Dfabric\.skipIntermediary='; "fabric.configDir"='-Dfabric\.configDir='; "fabric.loader.config"='-Dfabric\.loader\.config='; "fabric.log.level"='-Dfabric\.log\.level='; "fabric.debug.dumpClasspath"='-Dfabric\.debug\.dumpClasspath='; "fabric.log.config"='-Dfabric\.log\.config='; "fabric.dli.config"='-Dfabric\.dli\.config='; "fabric.mixin.configs"='-Dfabric\.mixin\.configs='; "fabric.mixin.hotSwap"='-Dfabric\.mixin\.hotSwap='; "fabric.mixin.debug.export"='-Dfabric\.mixin\.debug\.export='; "fabric.mixin.debug.verbose"='-Dfabric\.mixin\.debug\.verbose='; "fabric.gameVersion"='-Dfabric\.gameVersion='; "fabric.forceVersion"='-Dfabric\.forceVersion='; "fabric.autoDetectVersion"='-Dfabric\.autoDetectVersion='; "fabric.launcher.name"='-Dfabric\.launcher\.name='; "fabric.launcher.brand"='-Dfabric\.launcher\.brand='; "fabric.mods.toml.path"='-Dfabric\.mods\.toml\.path='; "fabric.customModList"='-Dfabric\.customModList='; "fabric.resolve.modFiles"='-Dfabric\.resolve\.modFiles='; "fabric.skipDependencyResolution"='-Dfabric\.skipDependencyResolution='; "fabric.loader.entrypoints"='-Dfabric\.loader\.entrypoints='; "fabric.language.providers"='-Dfabric\.language\.providers=';
+            "forge.addMods"='-Dforge\.addMods='; "forge.mods"='-Dforge\.mods='; "fml.coreMods.load"='-Dfml\.coreMods\.load='; "forge.coreMods.dir"='-Dforge\.coreMods\.dir='; "forge.modDir"='-Dforge\.modDir='; "forge.modsDirectories"='-Dforge\.modsDirectories='; "fml.customModList"='-Dfml\.customModList='; "forge.disableModScan"='-Dforge\.disableModScan='; "forge.modList"='-Dforge\.modList='; "forge.forceVersion"='-Dforge\.forceVersion='; "forge.disableUpdateCheck"='-Dforge\.disableUpdateCheck='; "forge.logging.mojang.level"='-Dforge\.logging\.mojang\.level='; "forge.mixin.hotSwap"='-Dforge\.mixin\.hotSwap='; "forge.resourcePack"='-Dforge\.resourcePack='; "forge.defaultResourcePack"='-Dforge\.defaultResourcePack='; "forge.texturePacks"='-Dforge\.texturePacks='; "forge.assetIndex"='-Dforge\.assetIndex='; "forge.assetsDir"='-Dforge\.assetsDir=';
+            "javaSecurityManager"='-Djava\.security\.manager='; "javaSecurityPolicy"='-Djava\.security\.policy='; "bootClasspath"='-Xbootclasspath'; "systemClassLoader"='-Djava\.system\.class\.loader='; "javaClassPath"='-Djava\.class\.path='; "cp"='-cp\s+["''][^"'';]*\.jar';
+            "cheatClientBrand"='-D(client|launcher)\.brand=(Wurst|Aristois|Impact|Kilo|Future|Lambda|Rusher|Konas|Phobos|Salhack|ForgeHax|Mathax|Meteor|Async|Seppuku|Xatz|Wolfram|Huzuni|Jigsaw|Zamorozka|Moon|Rage|Exhibition|Virtue|Novoline|Rekt|Skid|Ares|Abyss|Thunder|Tenacity|Rise|Flux|Gamesense|Intent|Remix|Sight|Vape|Shield|Ghost|Crispy|Inertia)';
+            "optifine"='-Doptifine\.'; "shadersmod"='-Dshaders?\.'; "shaderPack"='-Dshader[sP]ack='; "cheatPattern"='-D(xray|fly|speed|killaura|reach|esp|wallhack|noclip|autoclick|aimbot|triggerbot|antiknockback|nofall|timer|step|fullbright|nightvision|cavefinder)\.'
+        }
+        $cheatClients = @('Wurst','Aristois','Impact','Kilo','Future','Lambda','Rusher','Konas','Phobos','Salhack','ForgeHax','Mathax','Meteor','Async','Seppuku','Xatz','Wolfram','Huzuni','Jigsaw','Zamorozka','Moon','Rage','Exhibition','Virtue','Novoline','Rekt','Skid','Ares','Abyss','Thunder','Tenacity','Rise','Flux','Gamesense','Intent','Remix','Sight','Vape','Shield','Ghost','Crispy','Inertia')
+
+        foreach ($proc in $javaProcesses) {
+            try {
+                $cmdLine = (Get-WmiObject Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction Stop).CommandLine
+                if (-not $cmdLine) { continue }
+                Write-Host "  ┌─ Process: PID $($proc.Id) - $($proc.ProcessName)" -ForegroundColor Green
+                if ($cmdLine -match '^"([^"]+)"') { $cmdLine = $cmdLine.Substring($matches[1].Length + 2).Trim() }
+
+                $detectedPatterns = @(); $suspiciousArgs = @()
+                foreach ($k in $fabricPatterns.Keys) {
+                    if ($k -eq "addOpens" -or $k -eq "addExports") { continue }
+                    if ($cmdLine -match $fabricPatterns[$k]) {
+                        $detectedPatterns += $k
+                        $suspiciousArgs += ($cmdLine -split '\s+' | Where-Object { $_ -match $fabricPatterns[$k] })
+                    }
+                }
+                foreach ($cc in $cheatClients) {
+                    if ($cmdLine -match "(?i)\b$cc\b" -and $detectedPatterns -notcontains "CheatClient-$cc") { $detectedPatterns += "CheatClient-$cc" }
+                }
+                if ($cmdLine -match '(%3B|%26%26|%7C%7C|%7C|%60|%24|%3C|%3E)') { $detectedPatterns += "EncodedInjection" }
+
+                if ($detectedPatterns.Count -gt 0) {
+                    $foundInjection = $true
+                    Write-Host "  ├─ [✗] JVM INJECTION DETECTED`n" -ForegroundColor Red
+                    Write-Host "  │  Detected JVM Arguments:" -ForegroundColor Yellow
+                    $suspiciousArgs | Select-Object -Unique | ForEach-Object { Write-Host "  │    • $_" -ForegroundColor Magenta }
+                    Write-Host "`n  │  Detected Pattern Categories:" -ForegroundColor Yellow
+                    $grouped = @{}
+                    foreach ($p in $detectedPatterns) {
+                        $t = if ($p -match "^(fabric|forge|javaSecurity|bootClasspath|systemClassLoader|javaClassPath|cp|cheatClient|optifine|shadersmod|shaderPack|cheatPattern|EncodedInjection)") { $matches[1] } else { "other" }
+                        if (-not $grouped[$t]) { $grouped[$t] = @() }
+                        $grouped[$t] += $p
+                    }
+                    $typeMap = @{ fabric="Fabric Injection"; forge="Forge Injection"; javaSecurity="Security Bypass"; bootClasspath="Classpath Manipulation"; systemClassLoader="Class Loader"; javaClassPath="Class Path"; cp="Classpath (-cp)"; cheatClient="Cheat Client"; optifine="Optifine/Shaders"; shadersmod="Shader Mod"; shaderPack="Shader Pack"; cheatPattern="Cheat Pattern"; EncodedInjection="Encoded Injection"; other="Other" }
+                    foreach ($t in $grouped.Keys | Sort-Object) {
+                        Write-Host "  │    └─ $($typeMap[$t])" -ForegroundColor White
+                        $grouped[$t] | ForEach-Object { Write-Host "  │        • $($_ -replace 'CheatClient-','')" -ForegroundColor Red }
+                    }
+                    Write-Host "`n  └─ ⚠ WARNING: Potential cheat client or mod injection detected!`n" -ForegroundColor Red
+                } else {
+                    Write-Host "  └─ [✓] No JVM injection patterns detected`n" -ForegroundColor Green
+                }
+            } catch {
+                Write-Host "  └─ [!] Warning: Could not retrieve command line for PID $($proc.Id)" -ForegroundColor DarkYellow
+                Write-Host "      [i] Run as Administrator for complete detection.`n" -ForegroundColor DarkYellow
             }
         }
-    } catch { }
-    return $results
+        if (-not $foundInjection) { Write-Host "  [✓] CLEAN: No JVM argument injections detected in any Java process" -ForegroundColor Green }
+    }
 }
 
 function Write-Rule { param([string]$Char="─",[int]$Width=76,[ConsoleColor]$Color="DarkGray"); Write-Host ($Char*$Width) -ForegroundColor $Color }
@@ -640,11 +682,8 @@ foreach ($jar in $jarFiles) {
 }
 Write-Host "`r$(' '*100)`r" -NoNewline
 
-Write-Host "⚡ Scanning JVM for agents and injections..." -ForegroundColor DarkYellow
- $jvmFlags = Invoke-JvmScan
-if ($jvmFlags.Count -gt 0) { Write-Host "   ⚠️  JVM issues found!" -ForegroundColor Yellow }
-else { Write-Host "   ✓  JVM looks clean" -ForegroundColor DarkGray }
-Write-Host "`r$(' '*100)`r" -NoNewline
+# Call the Integrated JVM Scanner
+Invoke-JvmScan
 
 if ($verifiedMods.Count -gt 0) {
     Write-SectionHeader -Title "VERIFIED MODS" -Count $verifiedMods.Count -DotColor Green -CountColor Green
@@ -683,22 +722,6 @@ if ($obfuscatedMods.Count -gt 0) {
     Write-SectionHeader -Title "OBFUSCATED MODS" -Count $obfuscatedMods.Count -DotColor DarkYellow -CountColor Yellow
     Write-Rule "─" 76 DarkGray; Write-Host ""
     foreach ($mod in $obfuscatedMods) { Write-ObfuscationCard -Mod $mod }
-}
-
-if ($jvmFlags.Count -gt 0) {
-    Write-SectionHeader -Title "JVM / RUNTIME INJECTION" -Count $jvmFlags.Count -DotColor Yellow -CountColor Yellow
-    Write-Rule "─" 76 DarkGray; Write-Host ""
-    Write-Host ("  " + ("─"*70)) -ForegroundColor DarkYellow
-    Write-Host "  │ " -ForegroundColor DarkYellow -NoNewline
-    Write-Host " RUNTIME FLAGS " -ForegroundColor Black -BackgroundColor DarkYellow
-    Write-Host ("  " + ("─"*70)) -ForegroundColor DarkYellow
-    foreach ($flag in $jvmFlags) {
-        Write-Host "  │" -ForegroundColor DarkYellow
-        Write-Host "  │  • " -ForegroundColor DarkYellow -NoNewline
-        Write-Host $flag -ForegroundColor Yellow
-    }
-    Write-Host "  │" -ForegroundColor DarkYellow
-    Write-Host ("  " + ("─"*70)) -ForegroundColor DarkYellow; Write-Host ""
 }
 
 Write-Host "Scan complete." -ForegroundColor Green
