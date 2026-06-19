@@ -6,7 +6,7 @@
 ## Installation
 
 ```powershell
-powershell -ExecutionPolicy Bypass -Command "Invoke-Expression (Invoke-RestMethod 'https://raw.githubusercontent.com/NiccBlahh/AtlasModAnalyzer/refs/heads/main/ModAnalyzer.ps1')"
+powershell -ExecutionPolicy Bypass -Command "Invoke-Expression (Invoke-RestMethod 'https://raw.githubusercontent.com/NiccBlahh/AtlasModAnalyzer/refs/heads/main/AtlasModAnalyzer.ps1')"
 ```
 
 ---
